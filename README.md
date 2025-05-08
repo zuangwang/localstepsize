@@ -35,4 +35,7 @@ run "PEP_experiments.jl" in REPL
 
 
 ### 2. In command line
+```bash
 julia PEP_experiments.jl
+```
+
