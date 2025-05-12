@@ -24,7 +24,8 @@ This project implements a **Performance Estimation Problem (PEP)** framework for
 
 ## 📦 Installation
 
-- Julia(1.10 or above at https://julialang.org/install/)
+- Julia (version 1.10 or above):
+  Install from the official website: https://julialang.org/install/
 - Install [Mosek](https://www.mosek.com/) or other SDP solvers with a liscense.
 
 ## Test
