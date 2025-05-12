@@ -28,7 +28,7 @@ This project implements a **Performance Estimation Problem (PEP)** framework for
 - Install [Mosek](https://www.mosek.com/) or other SDP solvers with a liscense.
 
 ## Test
-You can run experiments in two ways:
+All required functions are defined in the PEP_SDP.jl file. You can run experiments in two ways:
 
 ### 1. From Julia REPL
 run "PEP_experiments.jl" in REPL
