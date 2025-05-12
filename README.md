@@ -38,4 +38,4 @@ run "PEP_experiments.jl" in REPL
 ```bash
 julia PEP_experiments.jl
 ```
-
+The output will be saved in the SDP_output directory.
