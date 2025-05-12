@@ -407,34 +407,7 @@ function Model_SDP(fctParams, K, mat, stepsize, algorithm, performance_criteria,
         @constraint(model_primal_PEP_with_predefined_stepsize, tr(Z * gs) .== 0)
     end
 
-    #bounded function heterogeneity(initial gradient constraint)
-    # gav0 = G[1][:, 1]
-    # if N > 1
-    #     for i = 2:N
-    #         gav0 = gav0 + G[1][:, i]
-    #     end
-    # end
-    # gav0 = gav0 ./ N
-
-    # G0 = (G[1][:,1] .- gav0)*(G[1][:,1] .- gav0)'
-    # if N > 1
-    #     for i = 2:N
-    #         G0 = G0 + (G[1][:,i] .- gav0)*(G[1][:,i] .- gav0)'
-    #     end
-    # end
-    # @constraint(model_primal_PEP_with_predefined_stepsize, tr(Z * G0) .<= N)
-    #non-equal start
-    # x0av_sum = X[1][:, 1]
-    # if N > 1
-    #     for i = 2:N
-    #         x0av_sum = x0av_sum + X[1][:, i]
-    #         #@constraint(model_primal_PEP_with_predefined_stepsize, tr(Z*(((x-xav_s)*(x-xav_s)'))).<=1)
-    #     end
-    # end
-    # x0_av = x0av_sum ./ N
-    #@constraint(model_primal_PEP_with_predefined_stepsize, tr(Z*(((x0_av-xav_s)*(x0_av-xav_s)'))).<=1)
-
-    #constri for start value
+    #constraints for start value
     #if algorithm == GD1
     if N > 1
         for i = 2:N
@@ -442,12 +415,6 @@ function Model_SDP(fctParams, K, mat, stepsize, algorithm, performance_criteria,
             @constraint(model_primal_PEP_with_predefined_stepsize, tr(Z * vec) .<= 0)
         end
     end
-    #end
-
-    #add constraint that fs = 0 for each i
-    # for i = 1:N
-    #     @constraint(model_primal_PEP_with_predefined_stepsize, F[(K+2)*N+i]==0)
-    # end
 
     if x_constraint_type == 1
         x0_sum = (X[1][:, 1] .- xav_s) * (X[1][:, 1] .- xav_s)'
@@ -482,8 +449,7 @@ function Model_SDP(fctParams, K, mat, stepsize, algorithm, performance_criteria,
 
     #enable silent mode
     set_silent(model_primal_PEP_with_predefined_stepsize)
-    #equal start
-    #@constraint(model_primal_PEP_with_predefined_stepsize, tr(Z*((X[:,1].-xav_s)*(X[:,1].-xav_s)')).<=1)
+
     #optimize
     @timeit to "optimization" begin
         @timeit to "optimization cost" optimize!(model_primal_PEP_with_predefined_stepsize)
