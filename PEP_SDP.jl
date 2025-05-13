@@ -659,7 +659,7 @@ function plot_save_pic(results, fctParams)
 
     save(dir_results, "results", results)
 
-    write(joinpath(top_dir, "information.txt"), "x0_constraint = $x0_constraint, xs_constraint = $xs_constraint, x_constraint_type = $x_constraint_type")
+    #write(joinpath(top_dir, "information.txt"), "x0_constraint = $x0_constraint, xs_constraint = $xs_constraint, x_constraint_type = $x_constraint_type")
 
     CSV.write(joinpath(top_dir, "plot_matrix.csv"), DataFrame(matrix_save, :auto))
 end
