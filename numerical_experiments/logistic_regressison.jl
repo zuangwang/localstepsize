@@ -328,7 +328,7 @@ end
 #     push!(y, mat[:, end])
 # end
 
-sample_number = 1
+sample_number = 50
 Ls = compute_Ls(A, number_of_agents, y, sample_number, mu)
 μs = mu.*ones(number_of_agents)
 println(Ls)
