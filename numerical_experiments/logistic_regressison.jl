@@ -172,7 +172,7 @@ function compute_Ls(A, number_of_agents, y, sample_number, mu)
     for i = 1:number_of_agents
         L = 0
         for j = 1:size(A[i])[1]
-            L += maximum(eigen(0.25 .* (y[i][j])^2 .* (A[i][j, :] * A[i][j, :]') .+ mu .* I(dim)).values)
+            L += maximum(eigen(0.25 .* (A[i][j, :] * A[i][j, :]') .+ mu .* I(dim)).values)
         end
         Ls[i] = L/size(A[i])[1]
     end
