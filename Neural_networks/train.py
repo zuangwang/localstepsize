@@ -25,7 +25,7 @@ from torch import Tensor
 from torch.nn import Module
 from torch.utils.data import BatchSampler, TensorDataset
 
-from ops import Optimizer, GD, DSGD
+from ops import Optimizer, GD, DSGD, FedAdaGrad, FedYogi, FedAdam, FedAvgM
 from models import CIFAR10CNN, MnistCNN
 
 warnings.filterwarnings("ignore")
@@ -65,6 +65,7 @@ class DTrainer:
                  seed=None,
                  regularization: float=.0,
                  load_prior_lr: bool = True,
+                 participate_rate: float=1.0,
                  ):
         self.dataset = dataset
         self.epochs = epochs
@@ -78,6 +79,7 @@ class DTrainer:
         self.w = w
         self.regularization = regularization
         self.load_prior_lr = load_prior_lr
+        self.participate_rate = participate_rate
 
         self.criterion = nn.CrossEntropyLoss()
 
@@ -657,6 +659,14 @@ class DSGDTrainer(DTrainer):
             torch.cuda.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
 
+            # Sample participating agents based on participate_rate
+            num_participate = max(1, int(self.agents * self.participate_rate))
+            participate_agents = sorted(random.sample(range(self.agents), num_participate))
+            
+            # Create fully connected w matrix for participating agents
+            from matrix import fully_connected_graph
+            w_partial = fully_connected_graph(num_participate, 1.0 / num_participate)
+
             for i in range(self.agents):
                 inputs, labels = data[i]
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
@@ -672,26 +682,42 @@ class DSGDTrainer(DTrainer):
                 vars[i] = self.opt.collect_x(self.agent_models[i].parameters())
                 grads[i] = self.opt.collect_grad(self.agent_models[i].parameters())
 
-                total_acc += (predicted_label.argmax(1) == labels).sum().item()
-                total_count += labels.size(0)
-                self.tol_train_loss += loss.item()
+                # Only count accuracy/loss for participating agents
+                if i in participate_agents:
+                    total_acc += (predicted_label.argmax(1) == labels).sum().item()
+                    total_count += labels.size(0)
+                    self.tol_train_loss += loss.item()
 
             lr_list = [(1.0 / x) for x in self.prior_lr]
             lr_constant = 1.0 / (sum(self.prior_lr) / len(self.prior_lr))
 
-            for i in range(self.agents):
+            # Update participating agents with consensus
+            for i in participate_agents:
                 self.agent_optimizers[i].step(
-                    lr_list= lr_list,
-                    lr_constant = lr_constant,
+                    lr_list=lr_list,
+                    lr_constant=lr_constant,
                     switching_k=self.K,
                     k=self.running_iteration,
                     vars=vars,
                     grads=grads,
+                    participate_agents=participate_agents,
+                    w_partial=w_partial,
                 )
+            
+            # Broadcast averaged model to all agents (including non-participating ones)
+            if num_participate < self.agents:
+                # Use the first participating agent's model as the reference
+                ref_agent = participate_agents[0]
+                for i in range(self.agents):
+                    if i not in participate_agents:
+                        # Copy parameters from reference agent to non-participating agents
+                        for p_i, p_ref in zip(self.agent_models[i].parameters(), 
+                                             self.agent_models[ref_agent].parameters()):
+                            p_i.data = p_ref.data.clone()
 
             if self.dataset.lower() in ('mnist',):
                 if self.running_iteration > 800:
-                    self.log_loss.append(self.tol_train_loss / (self.agents * switching_interval))
+                    self.log_loss.append(self.tol_train_loss / (num_participate * switching_interval))
                     if len(self.log_loss) > switching_interval:
                         slope = (self.log_loss[-1] - self.log_loss[-1 - switching_interval]) / switching_interval
                         if slope < 0 and abs(slope) < 0.1 and not self.K_assigned:
@@ -704,13 +730,240 @@ class DSGDTrainer(DTrainer):
 
                 if self.dataset.lower() in ('cifar10',):
                     if epoch >= 120:
-                        self.log_loss.append(self.tol_train_loss / (self.agents * log_interval))
+                        self.log_loss.append(self.tol_train_loss / (num_participate * log_interval))
                         if len(self.log_loss) > switching_interval and (len(self.log_loss)-1) % switching_interval == 0:
                             loss_diff = (self.log_loss[-1] - self.log_loss[-1 - switching_interval])/switching_interval
                             if loss_diff > 0.01 and not self.K_assigned:
                                 print(f"Switching will occur at epoch {epoch}, loss diff: {loss_diff:.4f}")
                                 self.K = self.running_iteration + 1
                                 self.K_assigned = True
+
+                for i in range(self.agents):
+                    self.test_agent_models[i].load_state_dict(self.agent_models[i].state_dict())
+                
+                # Adjust loss for partial participation before passing to logger
+                # it_logger expects loss to be divided by (self.agents * log_interval)
+                # but we only accumulated for num_participate agents, so we need to scale
+                adjusted_loss = self.tol_train_loss * self.agents / num_participate
+                
+                log_thread = threading.Thread(
+                    target=self.it_logger,
+                    args=[
+                        total_acc, total_count, epoch, log_interval, adjusted_loss,
+                        self.running_iteration, self.test_agent_models,
+                    ]
+                )
+                log_thread.start()
+
+                total_acc, total_count, self.tol_train_loss = .0, 0, .0
+                for i in range(self.agents):
+                    self.agent_models[i].train()
+
+        return total_acc
+
+
+class FedAdaptiveTrainer(DTrainer):
+    """Base class for FedAdaGrad, FedYogi, and FedAdam trainers"""
+    def __init__(self, *args, **kwargs):
+        # Will be set by subclasses
+        # self.opt = FedAdaGrad/FedYogi/FedAdam
+        # self.opt_name = "FedAdaGrad"/"FedYogi"/"FedAdam"
+        
+        self.agent_models: dict[int, Module] = {}
+        self.test_agent_models: dict[int, Module] = {}
+        self.agent_optimizers = {}
+        self.prior_lr: list[float] = []
+        self.beta1 = 0.9
+        self.beta2 = 0.99
+        self.tau = 1e-3
+        self.local_lr = 0.01
+        self.server_lr = 1.0
+
+        super().__init__(*args, **kwargs)
+        self.trainer()
+        self._save()
+
+    def gen_rand_model_state_dict(self, seeds: Sequence[int], /):
+        cycle_seeds = itertools.cycle(seeds)
+        while 1:
+            seed = next(cycle_seeds)
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+
+            temp_model = type(self.init_model)()
+            yield temp_model.state_dict()
+
+    def _cal_prior_lr(self, idx: int, /,  cal_times: int = 10000) -> float:
+        max_norm: float = .0
+        models = [(type(self.init_model)()).to(self.device) for _ in range(2)]
+
+        rand_seeds: list[int] = random.sample(range(0, 10000000), cal_times)
+        input_data, label = next(iter(self.prior_loader[idx]))
+        input_data, label = input_data.to(self.device), label.to(self.device)
+
+        model_gen: Iterator[dict] = self.gen_rand_model_state_dict(rand_seeds)
+        for i in range(cal_times):
+            grad: dict[int, list[Tensor]] = {}
+            models[0].load_state_dict(next(model_gen))
+            custom_init(models[0], self.dataset)
+            models[1].load_state_dict(models[0].state_dict())
+            if self.dataset.lower() in ('mnist', ):
+                add_noise_to_model(models[1], noise=1e-6)
+            elif self.dataset.lower() in ('cifar10', ):
+                add_noise_to_model(models[1], noise=1e-8)
+            for j, model in enumerate(models):
+                model.train()
+                model.zero_grad()
+                predicted_label = model(input_data)
+                loss = self.criterion(predicted_label, label) + self.cal_regular_item(
+                    model, self.regularization
+                )
+                loss.backward()
+                grad[j] = self.opt.collect_grad(model.parameters())
+
+            numerate: float = .0
+            denominate: float = .0
+            for n_x, n_y, d_x, d_y in zip(*grad.values(), *(list(model.parameters()) for model in models)):
+                numerate += torch.norm(n_x - n_y).item()
+                denominate += torch.norm(d_x - d_y).item()
+            max_norm = max(max_norm, numerate / denominate)
+
+        return max_norm
+
+    def agent_setup(self) -> None:
+        super().agent_setup()
+        for i in range(self.agents):
+            if i == 0:
+                self.agent_models[0] = self.init_model
+                self.test_agent_models[0] = self.model_copy(self.init_model)
+            else:
+                self.agent_models[i] = self.model_copy(self.agent_models[0])
+                self.test_agent_models[i] = self.model_copy(self.test_agent_models[0])
+
+            self.agent_models[i].to(self.device)
+            self.test_agent_models[i].to(self.device)
+            self.agent_models[i].train()
+
+            self.agent_optimizers[i] = self.opt(
+                params=self.agent_models[i].parameters(),
+                idx=i,
+                w=self.w,
+                agents=self.agents,
+                name=self.opt_name,
+                device=self.device,
+                beta1=self.beta1,
+                beta2=self.beta2,
+                tau=self.tau
+            )
+
+        file_dir = Path(__file__).parent.resolve()
+        pkl_name = 'Lipschitz constants'
+        if self.load_prior_lr and Path.exists(file_dir / f'{pkl_name}.pkl'):
+            with open(f'{pkl_name}.pkl', 'rb') as f:
+                self.prior_lr: list[float] = pickle.load(f)
+            print(f'Lipschitz constants loaded from {pkl_name}.pkl')
+        else:
+            agents = 10
+            print('Preparing the Lipschitz constants:')
+            for i in tqdm(range(agents), total=agents):
+                prior_lr_temp = self._cal_prior_lr(i)
+                self.prior_lr.append(prior_lr_temp)
+            with open(f'{pkl_name}.pkl', 'wb') as f:
+                pickle.dump(self.prior_lr, f)
+
+            for i in range(agents):
+                print(f"L{i}: {self.prior_lr[i]:<8.4f}")
+            print('Average Lipschitz:', sum(self.prior_lr) / len(self.prior_lr))
+            print(f'Lipschitz constants computed and saved to {pkl_name}.pkl')
+            sys.exit()
+
+        # Set learning rates
+        if self.dataset.lower() in ('mnist',):
+            self.local_lr = 0.01
+            self.server_lr = 1.0
+        elif self.dataset.lower() in ('cifar10',):
+            self.local_lr = 0.01
+            self.server_lr = 0.1
+
+        return None
+
+    def epoch_iterations(self, epoch):
+        log_interval = self.log_interval
+        total_acc, total_count = .0, 0
+        num_local_steps = 1  # K in the algorithm
+
+        for idx, data in enumerate(zip(*self.train_loader.values())):
+            self.running_iteration = idx + epoch * len(self.train_loader[0])
+
+            seed = self.seed
+            random.seed(seed)
+            os.environ['PYTHONHASHSEED'] = str(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+            # Sample participating agents based on participate_rate
+            num_participate = max(1, int(self.agents * self.participate_rate))
+            participate_agents = random.sample(range(self.agents), num_participate)
+
+            # Store initial models (x_t) before local updates
+            vars_before_local: dict[int, list[Tensor]] = {}
+            for i in participate_agents:
+                vars_before_local[i] = [p.data.clone().detach() for p in self.agent_models[i].parameters()]
+
+            # Perform K local SGD steps for each participating client
+            for i in participate_agents:
+                for local_step in range(num_local_steps):
+                    inputs, labels = data[i]
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    self.agent_models[i].train()
+                    self.agent_models[i].zero_grad()
+                    predicted_label = self.agent_models[i](inputs)
+
+                    loss = self.criterion(predicted_label, labels) + self.cal_regular_item(
+                        self.agent_models[i], self.regularization
+                    )
+                    loss.backward()
+
+                    # Local SGD update: x_{i,k+1} = x_{i,k} - eta * grad
+                    with torch.no_grad():
+                        for p in self.agent_models[i].parameters():
+                            if p.grad is not None:
+                                p.data = p.data - self.local_lr * p.grad.data
+
+                    # Track accuracy and loss on the last local step
+                    if local_step == num_local_steps - 1:
+                        total_acc += (predicted_label.argmax(1) == labels).sum().item()
+                        total_count += labels.size(0)
+                        self.tol_train_loss += loss.item()
+
+            # Collect models after local updates (x_{i,K})
+            vars_after_local: dict[int, list[Tensor]] = {}
+            for i in participate_agents:
+                vars_after_local[i] = [p.data.clone().detach() for p in self.agent_models[i].parameters()]
+
+            # Server-side adaptive aggregation
+            # Note: All agents share the same global model, so we update agent 0's optimizer
+            # and then broadcast to all agents
+            self.agent_optimizers[0].step(
+                local_lr=self.local_lr,
+                server_lr=self.server_lr,
+                vars_after_local=vars_after_local,
+                participate_agents=participate_agents,
+            )
+
+            # Broadcast updated global model to all agents
+            for i in range(self.agents):
+                if i != 0:
+                    for p_i, p_0 in zip(self.agent_models[i].parameters(), self.agent_models[0].parameters()):
+                        p_i.data = p_0.data.clone()
+
+            if 0 == self.running_iteration % log_interval:
+                self.tol_train_loss *= (log_interval if self.running_iteration == 0 else 1)
 
                 for i in range(self.agents):
                     self.test_agent_models[i].load_state_dict(self.agent_models[i].state_dict())
@@ -729,3 +982,271 @@ class DSGDTrainer(DTrainer):
 
         return total_acc
 
+
+class FedAdaGradTrainer(FedAdaptiveTrainer):
+    """Trainer for FedAdaGrad algorithm"""
+    def __init__(self, *args, **kwargs):
+        self.opt = FedAdaGrad
+        self.opt_name = "FedAdaGrad"
+        super().__init__(*args, **kwargs)
+
+
+class FedYogiTrainer(FedAdaptiveTrainer):
+    """Trainer for FedYogi algorithm"""
+    def __init__(self, *args, **kwargs):
+        self.opt = FedYogi
+        self.opt_name = "FedYogi"
+        super().__init__(*args, **kwargs)
+
+
+class FedAdamTrainer(FedAdaptiveTrainer):
+    """Trainer for FedAdam algorithm"""
+    def __init__(self, *args, **kwargs):
+        self.opt = FedAdam
+        self.opt_name = "FedAdam"
+        super().__init__(*args, **kwargs)
+
+
+class FedAvgMTrainer(DTrainer):
+    """Trainer for FedAvgM (FedAvg with Momentum) algorithm"""
+    def __init__(self, *args, **kwargs):
+        self.opt = FedAvgM
+        self.opt_name = "FedAvgM"
+        
+        self.agent_models: dict[int, Module] = {}
+        self.test_agent_models: dict[int, Module] = {}
+        self.agent_optimizers = {}
+        self.prior_lr: list[float] = []
+        self.beta = 0.9  # momentum coefficient for local training
+        self.local_lr = 0.01
+        self.server_lr = 1.0
+        self.num_local_steps = 1  # K in the algorithm
+        
+        # Global gradient estimate (g in the algorithm)
+        self.global_grad_estimate: dict[int, list[Tensor]] = {}
+
+        super().__init__(*args, **kwargs)
+        self.trainer()
+        self._save()
+
+    def gen_rand_model_state_dict(self, seeds: Sequence[int], /):
+        cycle_seeds = itertools.cycle(seeds)
+        while 1:
+            seed = next(cycle_seeds)
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+
+            temp_model = type(self.init_model)()
+            yield temp_model.state_dict()
+
+    def _cal_prior_lr(self, idx: int, /,  cal_times: int = 10000) -> float:
+        max_norm: float = .0
+        models = [(type(self.init_model)()).to(self.device) for _ in range(2)]
+
+        rand_seeds: list[int] = random.sample(range(0, 10000000), cal_times)
+        input_data, label = next(iter(self.prior_loader[idx]))
+        input_data, label = input_data.to(self.device), label.to(self.device)
+
+        model_gen: Iterator[dict] = self.gen_rand_model_state_dict(rand_seeds)
+        for i in range(cal_times):
+            grad: dict[int, list[Tensor]] = {}
+            models[0].load_state_dict(next(model_gen))
+            custom_init(models[0], self.dataset)
+            models[1].load_state_dict(models[0].state_dict())
+            if self.dataset.lower() in ('mnist', ):
+                add_noise_to_model(models[1], noise=1e-6)
+            elif self.dataset.lower() in ('cifar10', ):
+                add_noise_to_model(models[1], noise=1e-8)
+            for j, model in enumerate(models):
+                model.train()
+                model.zero_grad()
+                predicted_label = model(input_data)
+                loss = self.criterion(predicted_label, label) + self.cal_regular_item(
+                    model, self.regularization
+                )
+                loss.backward()
+                grad[j] = self.opt.collect_grad(model.parameters())
+
+            numerate: float = .0
+            denominate: float = .0
+            for n_x, n_y, d_x, d_y in zip(*grad.values(), *(list(model.parameters()) for model in models)):
+                numerate += torch.norm(n_x - n_y).item()
+                denominate += torch.norm(d_x - d_y).item()
+            max_norm = max(max_norm, numerate / denominate)
+
+        return max_norm
+
+    def agent_setup(self) -> None:
+        super().agent_setup()
+        for i in range(self.agents):
+            if i == 0:
+                self.agent_models[0] = self.init_model
+                self.test_agent_models[0] = self.model_copy(self.init_model)
+            else:
+                self.agent_models[i] = self.model_copy(self.agent_models[0])
+                self.test_agent_models[i] = self.model_copy(self.test_agent_models[0])
+
+            self.agent_models[i].to(self.device)
+            self.test_agent_models[i].to(self.device)
+            self.agent_models[i].train()
+
+            self.agent_optimizers[i] = self.opt(
+                params=self.agent_models[i].parameters(),
+                idx=i,
+                w=self.w,
+                agents=self.agents,
+                name=self.opt_name,
+                device=self.device,
+                beta=self.beta,
+                server_lr=self.server_lr
+            )
+
+        # Initialize global gradient estimate to zero
+        for i, p in enumerate(self.agent_models[0].parameters()):
+            self.global_grad_estimate[i] = [torch.zeros_like(p.data).to(self.device)]
+
+        file_dir = Path(__file__).parent.resolve()
+        pkl_name = 'Lipschitz constants'
+        if self.load_prior_lr and Path.exists(file_dir / f'{pkl_name}.pkl'):
+            with open(f'{pkl_name}.pkl', 'rb') as f:
+                self.prior_lr: list[float] = pickle.load(f)
+            print(f'Lipschitz constants loaded from {pkl_name}.pkl')
+        else:
+            agents = 10
+            print('Preparing the Lipschitz constants:')
+            for i in tqdm(range(agents), total=agents):
+                prior_lr_temp = self._cal_prior_lr(i)
+                self.prior_lr.append(prior_lr_temp)
+            with open(f'{pkl_name}.pkl', 'wb') as f:
+                pickle.dump(self.prior_lr, f)
+
+            for i in range(agents):
+                print(f"L{i}: {self.prior_lr[i]:<8.4f}")
+            print('Average Lipschitz:', sum(self.prior_lr) / len(self.prior_lr))
+            print(f'Lipschitz constants computed and saved to {pkl_name}.pkl')
+            sys.exit()
+
+        # Set learning rates
+        if self.dataset.lower() in ('mnist',):
+            self.local_lr = 0.01
+            self.server_lr = 1.0
+        elif self.dataset.lower() in ('cifar10',):
+            self.local_lr = 0.01
+            self.server_lr = 0.1
+
+        return None
+
+    def epoch_iterations(self, epoch):
+        log_interval = self.log_interval
+        total_acc, total_count = .0, 0
+
+        for idx, data in enumerate(zip(*self.train_loader.values())):
+            self.running_iteration = idx + epoch * len(self.train_loader[0])
+
+            seed = self.seed
+            random.seed(seed)
+            os.environ['PYTHONHASHSEED'] = str(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+            # Sample participating agents based on participate_rate
+            num_participate = max(1, int(self.agents * self.participate_rate))
+            participate_agents = random.sample(range(self.agents), num_participate)
+
+            # Store initial models before local updates (x^r)
+            vars_before_local: dict[int, list[Tensor]] = {}
+            for i in participate_agents:
+                vars_before_local[i] = [p.data.clone().detach() for p in self.agent_models[i].parameters()]
+
+            # Perform K local SGD steps for each participating client with momentum
+            for i in participate_agents:
+                # Initialize local momentum for this round
+                local_momentum: dict[int, Tensor] = {}
+                
+                for local_step in range(self.num_local_steps):
+                    inputs, labels = data[i]
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    self.agent_models[i].train()
+                    self.agent_models[i].zero_grad()
+                    predicted_label = self.agent_models[i](inputs)
+
+                    loss = self.criterion(predicted_label, labels) + self.cal_regular_item(
+                        self.agent_models[i], self.regularization
+                    )
+                    loss.backward()
+
+                    # Local update with momentum: g_i^{r,k} = β * ∇F_i(...) + (1-β) * g^r
+                    with torch.no_grad():
+                        for param_idx, p in enumerate(self.agent_models[i].parameters()):
+                            if p.grad is not None:
+                                current_grad = p.grad.data
+                                # Get global gradient estimate from previous round
+                                global_grad = self.global_grad_estimate[param_idx][0]
+                                
+                                # Momentum update: g_i^{r,k} = β * grad + (1-β) * g^r
+                                momentum_grad = self.beta * current_grad + (1 - self.beta) * global_grad
+                                
+                                # Local SGD update: x_i^{r,k+1} = x_i^{r,k} - η * g_i^{r,k}
+                                p.data = p.data - self.local_lr * momentum_grad
+
+                    # Track accuracy and loss on the last local step
+                    if local_step == self.num_local_steps - 1:
+                        total_acc += (predicted_label.argmax(1) == labels).sum().item()
+                        total_count += labels.size(0)
+                        self.tol_train_loss += loss.item()
+
+            # Collect models after local updates (x_i^{r,K})
+            vars_after_local: dict[int, list[Tensor]] = {}
+            for i in participate_agents:
+                vars_after_local[i] = [p.data.clone().detach() for p in self.agent_models[i].parameters()]
+
+            # Server-side aggregation and update
+            # All agents share the same global model, so we update agent 0's optimizer
+            self.agent_optimizers[0].step(
+                local_lr=self.local_lr,
+                server_lr=self.server_lr,
+                num_local_steps=self.num_local_steps,
+                vars_after_local=vars_after_local,
+                participate_agents=participate_agents,
+            )
+
+            # Retrieve the global gradient estimate g^{r+1} from optimizer state for next round
+            # This was computed during the step() function
+            for param_idx, p in enumerate(self.agent_models[0].parameters()):
+                optimizer_state = self.agent_optimizers[0].state[p]
+                self.global_grad_estimate[param_idx] = [optimizer_state['server_momentum'].clone()]
+
+            # Broadcast updated global model to all agents
+            for i in range(self.agents):
+                if i != 0:
+                    for p_i, p_0 in zip(self.agent_models[i].parameters(), self.agent_models[0].parameters()):
+                        p_i.data = p_0.data.clone()
+
+            if 0 == self.running_iteration % log_interval:
+                self.tol_train_loss *= (log_interval if self.running_iteration == 0 else 1)
+
+                for i in range(self.agents):
+                    self.test_agent_models[i].load_state_dict(self.agent_models[i].state_dict())
+                
+                # Adjust loss for partial participation before passing to logger
+                adjusted_loss = self.tol_train_loss * self.agents / num_participate
+                
+                log_thread = threading.Thread(
+                    target=self.it_logger,
+                    args=[
+                        total_acc, total_count, epoch, log_interval, adjusted_loss,
+                        self.running_iteration, self.test_agent_models,
+                    ]
+                )
+                log_thread.start()
+
+                total_acc, total_count, self.tol_train_loss = .0, 0, .0
+                for i in range(self.agents):
+                    self.agent_models[i].train()
+
+        return total_acc

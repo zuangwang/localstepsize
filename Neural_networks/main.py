@@ -1,7 +1,7 @@
 import argparse
 
 from matrix import fully_connected_graph
-from train import  GDTrainer, DSGDTrainer,  np, torch, os, random
+from train import  GDTrainer, DSGDTrainer, FedAdaGradTrainer, FedYogiTrainer, FedAdamTrainer, FedAvgMTrainer, np, torch, os, random
 from numpy import ndarray
 
 def main():
@@ -18,6 +18,9 @@ def main():
         parser.add_argument("-o", "--seed", default=30, type=int)
         parser.add_argument("--load_lr", action="store_true", default=True)
         parser.add_argument("--no-load_lr", dest="load_lr", action="store_false")
+        
+        # the partial participation rate
+        parser.add_argument("-p", "--partial_participate_rate", default=1, type=float)
         return parser.parse_args()
 
 
@@ -36,6 +39,7 @@ def main():
     switch_interval = args.switch_interval
     seed = args.seed
     load_lr = args.load_lr
+    participate_rate = args.partial_participate_rate
 
     if dataset.lower() in ('mnist', ):
         regularization: float = 0.01
@@ -60,6 +64,7 @@ def main():
                    seed=seed,
                    regularization=regularization,
                    load_prior_lr=load_lr,
+                   participate_rate=participate_rate,
                    )
     elif args.test_num == 1:
         DSGDTrainer(dataset=dataset, batch_size=bs, epochs=epochs, w=w, fname=fname,
@@ -69,7 +74,48 @@ def main():
                     seed=seed,
                     regularization=regularization,
                     load_prior_lr=load_lr,
+                    participate_rate=participate_rate,
                     )
+    elif args.test_num == 2:
+        FedAdaGradTrainer(dataset=dataset, batch_size=bs, epochs=epochs, w=w, fname=fname,
+                          agents=agents,
+                          log_interval=log_interval,
+                          switch_interval=switch_interval,
+                          seed=seed,
+                          regularization=regularization,
+                          load_prior_lr=load_lr,
+                          participate_rate=participate_rate,
+                          )
+    elif args.test_num == 3:
+        FedYogiTrainer(dataset=dataset, batch_size=bs, epochs=epochs, w=w, fname=fname,
+                       agents=agents,
+                       log_interval=log_interval,
+                       switch_interval=switch_interval,
+                       seed=seed,
+                       regularization=regularization,
+                       load_prior_lr=load_lr,
+                       participate_rate=participate_rate,
+                       )
+    elif args.test_num == 4:
+        FedAdamTrainer(dataset=dataset, batch_size=bs, epochs=epochs, w=w, fname=fname,
+                       agents=agents,
+                       log_interval=log_interval,
+                       switch_interval=switch_interval,
+                       seed=seed,
+                       regularization=regularization,
+                       load_prior_lr=load_lr,
+                       participate_rate=participate_rate,
+                       )
+    elif args.test_num == 5:
+        FedAvgMTrainer(dataset=dataset, batch_size=bs, epochs=epochs, w=w, fname=fname,
+                       agents=agents,
+                       log_interval=log_interval,
+                       switch_interval=switch_interval,
+                       seed=seed,
+                       regularization=regularization,
+                       load_prior_lr=load_lr,
+                       participate_rate=participate_rate,
+                       )
 
 
 if __name__ == "__main__":
