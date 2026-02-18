@@ -26,7 +26,15 @@ from torch.nn import Module
 from torch.utils.data import BatchSampler, TensorDataset
 
 from ops import Optimizer, GD, DSGD, FedAdaGrad, FedYogi, FedAdam, FedAvgM
-from models import CIFAR10CNN, MnistCNN
+from models import CIFAR10CNN, MnistCNN, TinyBERTClassifier, MobileBERTClassifier
+
+try:
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("Warning: transformers and datasets libraries not available. Install with: pip install transformers datasets")
 
 warnings.filterwarnings("ignore")
 
@@ -313,6 +321,90 @@ class DTrainer:
             train_set = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform_train)
             test_set = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform_test)
 
+        elif self.dataset.lower() in ('tinybert', 'mobilebert'):
+            # Load GLUE SST-2 dataset for sentiment classification
+            if not TRANSFORMERS_AVAILABLE:
+                raise RuntimeError("transformers and datasets libraries are required. Install with: pip install transformers datasets")
+            
+            print(f"==> Loading GLUE SST-2 dataset for {self.dataset}")
+            self.class_num = 2  # Binary sentiment classification
+            
+            # Load tokenizer based on model
+            if self.dataset.lower() == 'tinybert':
+                tokenizer = AutoTokenizer.from_pretrained('huawei-noah/TinyBERT_General_4L_312D')
+            else:  # mobilebert
+                tokenizer = AutoTokenizer.from_pretrained('google/mobilebert-uncased')
+            
+            # Load SST-2 dataset from GLUE
+            dataset = load_dataset('glue', 'sst2')
+            train_dataset = dataset['train']
+            test_dataset = dataset['validation']
+            
+            # Tokenize function
+            def tokenize_function(examples):
+                return tokenizer(examples['sentence'], padding='max_length', truncation=True, max_length=128)
+            
+            # Tokenize datasets
+            print("Tokenizing datasets...")
+            train_dataset = train_dataset.map(tokenize_function, batched=True)
+            test_dataset = test_dataset.map(tokenize_function, batched=True)
+            
+            # Set format for PyTorch
+            train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+            test_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+            
+            # Convert to PyTorch Dataset
+            class GLUEDataset(torch.utils.data.Dataset):
+                def __init__(self, hf_dataset):
+                    self.dataset = hf_dataset
+                    
+                def __len__(self):
+                    return len(self.dataset)
+                
+                def __getitem__(self, idx):
+                    item = self.dataset[idx]
+                    return (item['input_ids'], item['attention_mask']), item['label']
+            
+            train_set = GLUEDataset(train_dataset)
+            test_set = GLUEDataset(test_dataset)
+            
+            # Use simple data distribution for transformers - no class-based splitting
+            # Just split data evenly across agents
+            print(f"Distributing data across {self.agents} agents...")
+            train_size = len(train_set)
+            agent_size = train_size // self.agents
+            
+            self.train_loader: dict[int, torch.utils.data.DataLoader] = dict()
+            for i in range(self.agents):
+                start_idx = i * agent_size
+                end_idx = (i + 1) * agent_size if i < self.agents - 1 else train_size
+                agent_indices = list(range(start_idx, end_idx))
+                
+                agent_subset = torch.utils.data.Subset(train_set, agent_indices)
+                print(f'Agent {i} subset size: {len(agent_subset)}')
+                
+                self.train_loader[i] = torch.utils.data.DataLoader(
+                    agent_subset, 
+                    batch_size=self.batch_size, 
+                    shuffle=True,
+                    pin_memory=True, 
+                    num_workers=2, 
+                    drop_last=True
+                )
+            
+            # Test loader
+            self.test_loader = torch.utils.data.DataLoader(
+                test_set, 
+                batch_size=self.batch_size, 
+                shuffle=False,
+                pin_memory=True, 
+                num_workers=2, 
+                drop_last=False
+            )
+            
+            print(f"Train size: {train_size}, Test size: {len(test_set)}")
+            return None
+
         else:
             raise ValueError(f'{self.dataset} is not supported')
 
@@ -323,6 +415,18 @@ class DTrainer:
         else:
             self.distributed_distribution(train_set, test_set)
 
+    def forward_model(self, model: Module, inputs):
+        """
+        Helper function to handle both image-based and transformer-based models
+        For transformers: inputs is a tuple (input_ids, attention_mask)
+        For images: inputs is a tensor
+        """
+        if self.dataset.lower() in ('tinybert', 'mobilebert'):
+            input_ids, attention_mask = inputs
+            return model(input_ids, attention_mask)
+        else:
+            return model(inputs)
+    
     @classmethod
     def cal_regular_item(cls, model: Module, /, regularization: float = 0.0) -> Tensor:
         """ Helper function to calculate regularization term """
@@ -358,6 +462,15 @@ class DTrainer:
 
         elif self.dataset.lower() in ('mnist',):
             model = MnistCNN()
+        
+        elif self.dataset.lower() in ('tinybert',):
+            # TinyBERT with 10 classes for classification task
+            model = TinyBERTClassifier(num_classes=self.class_num, pretrained=True)
+        
+        elif self.dataset.lower() in ('mobilebert',):
+            # MobileBERT with 10 classes for classification task
+            model = MobileBERTClassifier(num_classes=self.class_num, pretrained=True)
+        
         else:
             raise ValueError(f'{self.dataset} is not supported')
         self.init_model = model
@@ -376,11 +489,18 @@ class DTrainer:
 
         with torch.no_grad():
             for inputs, labels in dataloader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
-
-                predicted_label = averaged_model(inputs)
+                # Handle transformer models (inputs is tuple) vs image models (inputs is tensor)
+                if self.dataset.lower() in ('tinybert', 'mobilebert'):
+                    input_ids, attention_mask = inputs
+                    input_ids = input_ids.to(self.device)
+                    attention_mask = attention_mask.to(self.device)
+                    labels = labels.to(self.device)
+                    predicted_label = averaged_model(input_ids, attention_mask)
+                else:
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+                    predicted_label = averaged_model(inputs)
+                
                 total_top1_acc += (predicted_label.argmax(1) == labels).sum().item()
-
                 total_count += labels.size(0)
 
         avg_top1_acc = total_top1_acc / total_count
@@ -482,7 +602,7 @@ class GDTrainer(DTrainer):
             self.centralized_optimizers2.zero_grad()
             self.centralized_models2.train()
 
-            predicted_label = self.centralized_models2(inputs)
+            predicted_label = self.forward_model(self.centralized_models2, inputs)
             loss = self.criterion(predicted_label, labels) + self.cal_regular_item(
                 self.centralized_models2, self.regularization
             )
@@ -565,7 +685,7 @@ class DSGDTrainer(DTrainer):
             for j, model in enumerate(models):
                 model.train()
                 model.zero_grad()
-                predicted_label = model(input_data)
+                predicted_label = self.forward_model(model, input_data)
                 loss = self.criterion(predicted_label, label) + self.cal_regular_item(
                     model, self.regularization
                 )
@@ -673,7 +793,7 @@ class DSGDTrainer(DTrainer):
 
                 self.agent_models[i].train()
                 self.agent_models[i].zero_grad()
-                predicted_label = self.agent_models[i](inputs)
+                predicted_label = self.forward_model(self.agent_models[i], inputs)
 
                 loss = self.criterion(predicted_label, labels) + self.cal_regular_item(
                     self.agent_models[i], self.regularization
@@ -816,7 +936,7 @@ class FedAdaptiveTrainer(DTrainer):
             for j, model in enumerate(models):
                 model.train()
                 model.zero_grad()
-                predicted_label = model(input_data)
+                predicted_label = self.forward_model(model, input_data)
                 loss = self.criterion(predicted_label, label) + self.cal_regular_item(
                     model, self.regularization
                 )
@@ -922,7 +1042,7 @@ class FedAdaptiveTrainer(DTrainer):
 
                     self.agent_models[i].train()
                     self.agent_models[i].zero_grad()
-                    predicted_label = self.agent_models[i](inputs)
+                    predicted_label = self.forward_model(self.agent_models[i], inputs)
 
                     loss = self.criterion(predicted_label, labels) + self.cal_regular_item(
                         self.agent_models[i], self.regularization
@@ -1062,7 +1182,7 @@ class FedAvgMTrainer(DTrainer):
             for j, model in enumerate(models):
                 model.train()
                 model.zero_grad()
-                predicted_label = model(input_data)
+                predicted_label = self.forward_model(model, input_data)
                 loss = self.criterion(predicted_label, label) + self.cal_regular_item(
                     model, self.regularization
                 )
@@ -1173,7 +1293,7 @@ class FedAvgMTrainer(DTrainer):
 
                     self.agent_models[i].train()
                     self.agent_models[i].zero_grad()
-                    predicted_label = self.agent_models[i](inputs)
+                    predicted_label = self.forward_model(self.agent_models[i], inputs)
 
                     loss = self.criterion(predicted_label, labels) + self.cal_regular_item(
                         self.agent_models[i], self.regularization

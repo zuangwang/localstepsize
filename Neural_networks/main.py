@@ -13,7 +13,7 @@ def main():
         parser.add_argument("-e", "--epochs", default=150, type=int)
         parser.add_argument("-b", "--batch_size", default=10, type=int)
         parser.add_argument("-a", "--agents", default=10, type=int)
-        parser.add_argument("-d", "--dataset", default="cifar10")
+        parser.add_argument("-d", "--dataset", default="tinybert")
         parser.add_argument("-c", "--switch-interval", default=5, type=int)
         parser.add_argument("-o", "--seed", default=30, type=int)
         parser.add_argument("--load_lr", action="store_true", default=True)
@@ -47,6 +47,10 @@ def main():
     elif dataset.lower() in ('cifar10', ):
         regularization: float = 1e-5
         log_interval: int = 499
+    elif dataset.lower() in ('tinybert', 'mobilebert'):
+        # Default hyperparameters for transformer models
+        regularization: float = 0.01
+        log_interval: int = 100
     else:
         raise ValueError(f'{dataset} is not supported')
 

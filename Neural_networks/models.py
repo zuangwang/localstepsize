@@ -1,5 +1,7 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoModel, DistilBertModel, DistilBertConfig
 
 class CIFAR10CNN(nn.Module):
     def __init__(self):
@@ -58,5 +60,58 @@ class MnistCNN(nn.Module):
         return x
 
 
+# ============================================================================
+# Transformer-based Language Models from Hugging Face
+# ============================================================================
+
+class TinyBERTClassifier(nn.Module):
+    """
+    TinyBERT: 4-layer, 312 hidden size version with ~14.5M parameters.
+    Even smaller than DistilBERT, suitable for resource-constrained environments.
+    """
+    def __init__(self, num_classes=2, pretrained=True):
+        super().__init__()
+        if pretrained:
+            self.tinybert = AutoModel.from_pretrained('huawei-noah/TinyBERT_General_4L_312D')
+        else:
+            config = DistilBertConfig(
+                num_hidden_layers=4,
+                hidden_size=312,
+                intermediate_size=1200,
+                num_attention_heads=12
+            )
+            self.tinybert = DistilBertModel(config)
+        
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(312, num_classes)  # TinyBERT hidden size is 312
+        
+    def forward(self, input_ids, attention_mask=None):
+        outputs = self.tinybert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.last_hidden_state[:, 0]  # CLS token
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        return logits
 
 
+class MobileBERTClassifier(nn.Module):
+    """
+    MobileBERT: Compact task-agnostic BERT with 25M parameters.
+    Optimized for mobile devices with 4.3x smaller and 5.5x faster than BERT-base.
+    """
+    def __init__(self, num_classes=2, pretrained=True):
+        super().__init__()
+        if pretrained:
+            self.mobilebert = AutoModel.from_pretrained('google/mobilebert-uncased')
+        else:
+            # MobileBERT doesn't have a simple config, so use AutoModel
+            self.mobilebert = AutoModel.from_pretrained('google/mobilebert-uncased')
+        
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(512, num_classes)  # MobileBERT hidden size is 512
+        
+    def forward(self, input_ids, attention_mask=None):
+        outputs = self.mobilebert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.pooler_output
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        return logits
